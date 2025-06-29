@@ -12,6 +12,12 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
+type CountdownCancel struct {
+	envName string
+	ttl     int
+	cancel  context.CancelFunc
+}
+
 func Init() {
 	config, err := clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
 	if err != nil {
@@ -24,31 +30,36 @@ func Init() {
 		os.Exit(1)
 	}
 
-	namespaces, err := getNamespaces(client, labels.Set{"kelm.riftonix.io/managed": "true"})
+	envs, err := getEnvs(client, labels.Set{"kelm.riftonix.io/managed": "true"})
 	if err != nil {
 		logrus.Errorf("Failed to get namespaces: %v", err)
 		os.Exit(1)
 	}
-
-	logrus.Infof("Found %d managed namespaces:\n", len(namespaces))
-	for _, ns := range namespaces {
-		removalTtl := ns.Annotations["kelm.riftonix.io/ttl.removal"]
-		remainingTtl, err := timer.GetTimeUntilRemoval(ns.CreationTimestamp.Time, removalTtl)
-		if err != nil {
-			logrus.Errorf("Failed to parse annotations: %v\n", err)
-			os.Exit(1)
+	countdowns := make([]CountdownCancel, 0)
+	for envName, env := range envs {
+		for _, ns := range env.Namespaces {
+			entityAge := timer.GetEntityAge(ns.CreationTimestamp.Time)
+			logrus.WithFields(logrus.Fields{
+				"namespace":                 ns.Name,
+				"created":                   ns.CreationTimestamp.Time.String(),
+				"age":                       entityAge,
+				"ttl":                       env.RemainingTtl,
+				"annotations":               ns.Annotations,
+				"labels":                    ns.Labels,
+				"replenishRatio":            env.ReplenishRatio,
+				"RemainingNotificationsTtl": env.RemainingNotificationsTtl,
+			}).Debug("Namespaces info:")
 		}
-		entityAge := timer.GetEntityAge(ns.CreationTimestamp.Time)
-		logrus.WithFields(logrus.Fields{
-			"namespace":   ns.Name,
-			"created":     ns.CreationTimestamp.Time.String(),
-			"age":         entityAge,
-			"ttl":         remainingTtl.String(),
-			"annotations": ns.Annotations,
-			"labels":      ns.Labels,
-		}).Debug("Namespaces info:")
-		ctx, _ := context.WithCancel(context.Background())
-		go timer.CreateCountdown(ctx, ns.Name, int(remainingTtl.Seconds()))
+		ctx, cancel := context.WithCancel(context.Background())
+		countdowns = append(countdowns, CountdownCancel{
+			envName: envName,
+			cancel:  cancel,
+			ttl:     int(env.RemainingTtl.Seconds()),
+		})
+		go timer.CreateCountdown(ctx, envName, int(env.RemainingTtl.Seconds()), "removal")
+		for _, remainingNotificationTtl := range env.RemainingNotificationsTtl {
+			go timer.CreateCountdown(ctx, envName, int(remainingNotificationTtl.Seconds()), "notification")
+		}
 	}
 	select {}
 }
