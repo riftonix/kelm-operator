@@ -17,82 +17,161 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
+type RawEnvPart struct {
+	Name                string
+	IsManaged           bool
+	EnvName             string
+	Ttl                 string
+	ReplenishRatio      float64
+	NotificationFactors []float64
+	NsData              core.Namespace
+	CreationTimestamp   time.Time
+	UpdateTimestamp     time.Time
+}
+
+type RawEnv struct {
+	Name                string
+	Namespaces          []core.Namespace
+	Ttl                 string `default:"0s"`
+	ReplenishRatio      float64
+	NotificationFactors []float64
+	CreationTimestamp   time.Time
+	UpdateTimestamp     time.Time
+}
+
 type Env struct {
 	Name                      string
-	Namespaces                []core.Namespace
+	Namespaces                []string
 	RemainingTtl              time.Duration
 	ReplenishRatio            float64
 	RemainingNotificationsTtl []time.Duration
+	CreationTimestamp         time.Time
+	UpdateTimestamp           time.Time
 }
 
-func handleNamespace(ns core.Namespace) (string, string, float64, []float64, error) {
+func handleNamespace(ns core.Namespace) (RawEnvPart, error) {
 	isManaged := ns.Labels["kelm.riftonix.io/managed"]
 	envName := ns.Labels["kelm.riftonix.io/env.name"]
 	ttl := ns.Annotations["kelm.riftonix.io/ttl.removal"]
 	replenishRatio := ns.Annotations["kelm.riftonix.io/ttl.replenishRatio"]
 	notificationFactors := ns.Annotations["kelm.riftonix.io/ttl.notificationFactors"]
+	updateTimestamp := ns.Annotations["kelm.riftonix.io/updateTimestamp"]
+	var rawEnvPart RawEnvPart
 	if isManaged != "true" {
-		return "", "", 0, []float64{}, fmt.Errorf("Namespace %s label kelm.riftonix.io/managed is not true", ns.Name)
+		return rawEnvPart, fmt.Errorf("namespace %s label kelm.riftonix.io/managed is not true", ns.Name)
 	}
 	if envName == "" {
-		return "", "", 0, []float64{}, fmt.Errorf("Namespace %s has empty label kelm.riftonix.io/env.name", ns.Name)
+		return rawEnvPart, fmt.Errorf("namespace %s has empty label kelm.riftonix.io/env.name", ns.Name)
 	}
 	if ttl == "" {
-		return "", "", 0, []float64{}, fmt.Errorf("Namespace %s has empty annotation kelm.riftonix.io/ttl.removal", ns.Name)
+		return rawEnvPart, fmt.Errorf("namespace %s has empty annotation kelm.riftonix.io/ttl.removal", ns.Name)
 	}
 	if replenishRatio == "" {
-		return "", "", 0, []float64{}, fmt.Errorf("Namespace %s has empty annotation kelm.riftonix.io/ttl.replenishRatio", ns.Name)
+		return rawEnvPart, fmt.Errorf("namespace %s has empty annotation kelm.riftonix.io/ttl.replenishRatio", ns.Name)
 	}
-	parsedReplenishRatio, err := strconv.ParseFloat(replenishRatio, 8)
+	parsedReplenishRatio, err := strconv.ParseFloat(replenishRatio, 64)
 	if err != nil {
-		return "", "", 0, []float64{}, fmt.Errorf("Failed to parse namespace %s annotation kelm.riftonix.io/ttl.replenishRatio '%s': %w", ns.Name, replenishRatio, err)
+		return rawEnvPart, fmt.Errorf("failed to parse namespace %s annotation kelm.riftonix.io/ttl.replenishRatio '%s': %w", ns.Name, replenishRatio, err)
 	}
 	if notificationFactors == "" {
-		return "", "", 0, []float64{}, fmt.Errorf("Namespace %s has empty annotation kelm.riftonix.io/ttl.notificationFactors", ns.Name)
+		return rawEnvPart, fmt.Errorf("namespace %s has empty annotation kelm.riftonix.io/ttl.notificationFactors", ns.Name)
+	}
+	if updateTimestamp == "" {
+		return rawEnvPart, fmt.Errorf("namespace %s has empty annotation kelm.riftonix.io/updateTimestamp", ns.Name)
+	}
+	parsedUpdateTimestamp, err := timer.ParseTime(updateTimestamp)
+	if err != nil {
+		return rawEnvPart, fmt.Errorf("failed to parse namespace %s annotation kelm.riftonix.io/updateTimestamp '%s': %w", ns.Name, updateTimestamp, err)
 	}
 	var unmarshaledNotificationFactors []float64
 	err = json.Unmarshal([]byte(notificationFactors), &unmarshaledNotificationFactors)
 	if err != nil {
-		return "", "", 0, []float64{}, fmt.Errorf("Failed to parse namespace %s annotation kelm.riftonix.io/ttl.notificationFactors '%s': %w", ns.Name, notificationFactors, err)
+		return rawEnvPart, fmt.Errorf("failed to parse namespace %s annotation kelm.riftonix.io/ttl.notificationFactors '%s': %w", ns.Name, notificationFactors, err)
 	}
-	return envName, ttl, parsedReplenishRatio, unmarshaledNotificationFactors, nil
+	rawEnvPart.Name = ns.Name
+	rawEnvPart.IsManaged = true
+	rawEnvPart.EnvName = envName
+	rawEnvPart.Ttl = ttl
+	rawEnvPart.ReplenishRatio = parsedReplenishRatio
+	rawEnvPart.NotificationFactors = unmarshaledNotificationFactors
+	rawEnvPart.NsData = ns
+	rawEnvPart.CreationTimestamp = ns.CreationTimestamp.Time.UTC()
+	rawEnvPart.UpdateTimestamp = parsedUpdateTimestamp
+	return rawEnvPart, nil
+}
+
+func updateRawEnv(rawEnv RawEnv, rawEnvPart RawEnvPart) RawEnv {
+	var err error
+	rawEnv.Name = rawEnvPart.EnvName
+	rawEnv.Namespaces = append(rawEnv.Namespaces, rawEnvPart.NsData)
+	if rawEnv.Ttl == "" {
+		rawEnv.Ttl = "0s" // Default value
+	}
+	rawEnv.Ttl, err = timer.GetMaxDuration(rawEnv.Ttl, rawEnvPart.Ttl)
+	if err != nil {
+		// You should not see this log, rawEnvPart already validated
+		logrus.Warningf("Ttl in %s has bad format '%s': %v", rawEnvPart.Name, rawEnvPart.Ttl, err)
+	}
+	rawEnv.ReplenishRatio = max(rawEnv.ReplenishRatio, rawEnvPart.ReplenishRatio)
+	rawEnv.NotificationFactors = append(rawEnv.NotificationFactors, rawEnvPart.NotificationFactors...)
+	slices.Sort(rawEnv.NotificationFactors)
+	rawEnv.NotificationFactors = slices.Compact(rawEnv.NotificationFactors)
+	rawEnv.CreationTimestamp = timer.GetMaxTime(rawEnv.CreationTimestamp, rawEnvPart.CreationTimestamp)
+	rawEnv.UpdateTimestamp = timer.GetMaxTime(rawEnv.UpdateTimestamp, rawEnvPart.UpdateTimestamp)
+	return rawEnv
 }
 
 func getEnvs(client *kubernetes.Clientset, labelsSet labels.Set) (map[string]Env, error) {
 	filter := meta.ListOptions{
 		LabelSelector: labels.SelectorFromSet(labelsSet).String(),
 	}
+	logrus.Debug("Gathering namespaces...")
 	namespaces, err := client.CoreV1().Namespaces().List(context.Background(), filter)
 	if err != nil {
 		return nil, err
 	}
 	envs := make(map[string]Env)
+	rawEnvs := make(map[string]RawEnv)
 	for _, ns := range namespaces.Items {
-		envName, ttl, replenishRatio, notificationFactors, err := handleNamespace(ns)
+		rawEnvPart, err := handleNamespace(ns)
 		if err != nil {
 			logrus.Warningf("%v", err)
 			continue
 		}
-		env := envs[envName]
-		env.Namespaces = append(env.Namespaces, ns)
-		remainingTtl, err := timer.GetDuration(ns.CreationTimestamp.Time, ttl, 1)
+		rawEnvs[rawEnvPart.EnvName] = updateRawEnv(rawEnvs[rawEnvPart.EnvName], rawEnvPart)
+	}
+	for _, rawEnv := range rawEnvs {
+		var env Env
+		env.Name = rawEnv.Name
+		for _, ns := range rawEnv.Namespaces {
+			env.Namespaces = append(env.Namespaces, ns.Name)
+		}
+		env.RemainingTtl, err = timer.GetDuration(rawEnv.CreationTimestamp, rawEnv.Ttl, 1)
 		if err != nil {
-			logrus.Warningf("Failed to parse annotations in %s: %v\n", ns.Name, err)
+			// You should not see this log, rawEnvPart already validated
+			logrus.Warningf("Failed to parse annotations in %s: %v\n", rawEnv.Name, err)
 			continue
 		}
-		env.RemainingTtl = max(env.RemainingTtl, remainingTtl)
-		env.ReplenishRatio = replenishRatio
-		for _, factor := range notificationFactors {
-			remainingNotificationTtl, err := timer.GetDuration(ns.CreationTimestamp.Time, ttl, factor)
+		env.ReplenishRatio = rawEnv.ReplenishRatio
+		for _, factor := range rawEnv.NotificationFactors {
+			remainingNotificationTtl, err := timer.GetDuration(rawEnv.CreationTimestamp, rawEnv.Ttl, factor)
 			if err != nil {
-				logrus.Warningf("Failed to parse annotations in %s: %v\n", ns.Name, err)
+				logrus.Warningf("Failed to parse annotations in %s: %v", rawEnv.Name, err)
 				continue
 			}
 			env.RemainingNotificationsTtl = append(env.RemainingNotificationsTtl, remainingNotificationTtl)
 		}
-		slices.Sort(env.RemainingNotificationsTtl)
-		slices.Compact(env.RemainingNotificationsTtl)
-		envs[envName] = env
+		env.CreationTimestamp = rawEnv.CreationTimestamp
+		env.UpdateTimestamp = rawEnv.UpdateTimestamp
+		logrus.WithFields(logrus.Fields{
+			"Namespaces":                env.Namespaces,
+			"RemainingTtl":              env.RemainingTtl,
+			"ReplenishRatio":            env.ReplenishRatio,
+			"RemainingNotificationsTtl": env.RemainingNotificationsTtl,
+			"CreationTimestamp":         env.CreationTimestamp,
+			"UpdateTimestamp":           env.UpdateTimestamp,
+		}).Infof("Env '%s' created", env.Name)
+		envs[rawEnv.Name] = env
 	}
 	return envs, nil
 }
